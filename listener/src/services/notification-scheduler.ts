@@ -15,6 +15,7 @@ import { determineDeliveryOutcome } from '../types/delivery-receipt';
 import { DeliveryResult } from '../types/provider-capabilities';
 import { NotificationClaimLease, startClaimLease } from './notification-claim-lease';
 import { nextLocalOccurrence, readLocalSchedule } from './local-schedule';
+import { isWithinDeliveryWindow, nextDeliveryWindowOpening } from './delivery-window';
 
 /**
  * Background scheduler that processes scheduled notifications
@@ -401,6 +402,43 @@ export class NotificationScheduler {
           now,
           missedByMs: timeDiff,
         });
+      }
+
+      // Respect the recipient's quiet hours / delivery window. Events received
+      // during restricted periods are never discarded: the record is kept and
+      // re-scheduled for the next window opening, at which point delivery
+      // resumes through the normal poll cycle.
+      const windowCheck = isWithinDeliveryWindow(notification, this.clock());
+      if (!windowCheck.allowed) {
+        const nextOpening = nextDeliveryWindowOpening(notification, this.clock());
+        logger.info('Notification deferred until delivery window opens', {
+          requestId,
+          id: notification.id,
+          reason: windowCheck.reason,
+          nextOpening,
+        });
+        await this.repository.markAsFailedOrRetry(
+          notification.id!,
+          new Error(`Deferred until delivery window opens: ${windowCheck.reason}`),
+          notification.retryCount,
+          notification.maxRetries,
+          nextOpening,
+        );
+        await this.repository.logExecution({
+          scheduledNotificationId: notification.id!,
+          executionAttempt,
+          executionTime: new Date(),
+          status: 'RETRY',
+          errorMessage: `Deferred until delivery window opens: ${windowCheck.reason}`,
+          durationMs: Date.now() - startTime,
+        });
+        if (jobId) {
+          jobMonitor.completeJob(jobId, {
+            notificationId: notification.id,
+            deferredUntil: nextOpening.toISOString(),
+          });
+        }
+        return;
       }
 
       // Verify payload integrity before executing
